@@ -12,13 +12,14 @@ import current_sharing as cs
 
 #helper class to store SAA information
 class squid:
-    def __init__(self, zt, rdyn, inoise, lin, 
+    def __init__(self, zt, rdyn, inoise, lin, lstray = 10e-9,
                  n_series=False, n_parallel = False, power = False,
                  linear_range=2e-6, snubber = False, snubber_c = False, t=0.3):
         self.zt = zt            #Transimpedance of SAA
         self.rdyn = rdyn        #Dynamic impedance of SAA
         self.inoise = inoise    #SAA noise refered to input coil
         self.lin = lin          #input inductance of the SAA
+        self.lstray = lstray
         self.n_series = n_series #number of individual SQUIDs in series to form the SAA
         self.n_parallel = n_parallel #number of banks of SQUIDs in parallel to form the SAA
         self.power = power      #power dissipated by SAA when in operation
@@ -38,7 +39,7 @@ class squid:
             return
         self.zt *= new_series / self.n_series
         self.rdyn *= new_series / new_parallel * self.n_parallel / self.n_series
-        self.lin *= new_series * new_parallel / self.n_series / self.n_parallel
+        self.lin = (self.lin - self.lstray) * new_series * new_parallel / self.n_series / self.n_parallel + self.lstray
         self.inoise *= np.sqrt(self.n_series * self.n_parallel ) / np.sqrt(new_series * new_parallel)
         self.power *= new_series * new_parallel / self.n_series / self.n_parallel
         self.n_series = new_series
@@ -47,7 +48,7 @@ class squid:
     #method to scale the mutual inductance of the existing SAA up or down
     def change_mutual_ind(self, m_factor):
         self.zt *= m_factor
-        self.lin *= m_factor**2
+        self.lin = (self.lin - self.lstray) * m_factor**2 + self.lstray
         self.linear_range *= m_factor
         self.m_factor *= m_factor
         
@@ -198,6 +199,7 @@ class dfmux_noise:
                   dan=True,          #if this is a dan on noise calculation or not
                   skip_spice = False,#if you want to skip the pyspice sim and fall back on an approximation
                   recal_csf = True,  #if you want to recalculate csf from scratch each time , only set to False for iterating SAA size, only Lin is changed
+                  csf_factor = False, #if you want to assume you're underestimating the CSF by x% set to 1.x instead of False and it will be applied to the calculated csf
                   csf=None):         #if you want to calculate noise with a given csf (this must be the same size as frequencies)
         
             
@@ -304,7 +306,9 @@ class dfmux_noise:
         else:
             self.csf = np.ones(lens(self.f))
                 
-                
+        #applying the CSF factor if asked for
+        if csf_factor != False:
+            self.csf *= csf_factor
                 
         #calculating the transfer function caused by the SAA Z_dyn and the wiring harness capacitance/any shunts across SAA
         self.tf = np.array(self.wire.transfer_function(self.squid,self.f))
@@ -371,7 +375,7 @@ def plot_noise(dfmux_noise,f,c,label=None):
     plt.plot(f/1e6,dfmux_noise.total,c=c,label=label)
     plt.legend()
     plt.plot(f/1e6,np.abs(dfmux_noise.demod)*1e12 ,'--',label='Expected DEMOD noise',c=c)
-    plt.plot(f/1e6,[np.abs(dfmux_noise.csf[i] * dfmux_noise.squid.inoise )*1e12 for i in range(len(f))] ,'-.',label='Expected SAA noise',c=c)
+    plt.plot(f/1e6,np.abs(dfmux_noise.saa_scale )*1e12 ,'-.',label='Expected SAA noise',c=c)
     plt.plot(f/1e6,[np.abs(dfmux_noise.jnoise )*1e12 for i in range(len(f))] ,':', label = 'Johnson',lw=2,c=c)
     plt.plot(f/1e6,[np.abs(dfmux_noise.warm_noise_nc )*1e12 for i in range(len(f))] ,':', label = 'warm n/c',c=c)
     if c == colors[0]:
