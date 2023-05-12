@@ -4,6 +4,7 @@ import dfmux_calc as d
 import nep_calc as n
 import matplotlib
 matplotlib.use('Agg')
+import pickle as pk
 
 import sys
 
@@ -15,6 +16,9 @@ from config import *
 if mut != False:
         saa.change_mutual_ind(mut)
         
+
+if dump_data == True:
+    pk_out = {}
         
 #printing info about how close to done this is
 tracker_total = 100*len(bands)
@@ -89,27 +93,34 @@ for band in bands:
                     req_nsq[i][j] = n_sq
                     fail[i][j] = 0
                     csf[i][j] = dfm.csf[0]
+
                     
-                    if [i,j] == [itarget,jtarget]:
+                    if [i,j] == [itarget,jtarget] or dump_data==True:
                         dfm.init_freq(bias_f,skip_spice=skip_spice,csf_factor=csf_factor)
-                        fig, ax = plt.subplots()
-                        d.plot_noise(dfm,bias_f,u'#1f77b4')
-                        plt.plot([np.min(bias_f)/1e6,np.max(bias_f)/1e6],[target,target],'--',label='NEI Requirement',c=u'#ff7f0e')
-                        ax.set_title('Readout NEI for {} GHz band $R_{{bolo}}$={}$\Omega$ $R{{stray}}$={}$\Omega$, \n $\mathcal{{L}}=${}, NEP$_{{read}}$={}aW$/\sqrt{{\mathrm{{Hz}}}}$, {}% NEP increase'.format(
-                        lb.opt_freqs[band] ,round(dfm.bolo.r,2), round(dfm.bolo.rstray,2), bolo.loopgain, round(nep*1e18,1), frac*100))
-                        plt.legend()
-                        plt.savefig(path + '/band_'+str(band) + '_readout_nei.png')
+                        if [i,j] == [itarget,jtarget]:
+                            fig, ax = plt.subplots()
+                            d.plot_noise(dfm,bias_f,u'#1f77b4')
+                            plt.plot([np.min(bias_f)/1e6,np.max(bias_f)/1e6],[target,target],'--',label='NEI Requirement',c=u'#ff7f0e')
+                            ax.set_title('Readout NEI for {} GHz band $R_{{bolo}}$={}$\Omega$ $R{{stray}}$={}$\Omega$, \n $\mathcal{{L}}=${}, NEP$_{{read}}$={}aW$/\sqrt{{\mathrm{{Hz}}}}$, {}% NEP increase'.format(
+                            lb.opt_freqs[band] ,round(dfm.bolo.r,2), round(dfm.bolo.rstray,2), bolo.loopgain, round(nep*1e18,1), frac*100))
+                            plt.legend()
+                            plt.savefig(path + '/band_'+str(band) + '_readout_nei.png')
+                            
+                            fig, ax = plt.subplots()
+                            plt.plot(bias_f/1e6, 1/dfm.tf, label='1/TF')
+                            plt.plot(bias_f/1e6, dfm.csf, label='CS')
+                            plt.xlabel('Bias frequency [MHz]')
+                            ax.set_title('TF + CS for {} GHz band $R_{{bolo}}$={}$\Omega$ $R{{stray}}$={}$\Omega$, \n $\mathcal{{L}}=${}, NEP$_{{read}}$={}aW$/\sqrt{{\mathrm{{Hz}}}}$, {}% NEP increase'.format(
+                            lb.opt_freqs[band] ,round(dfm.bolo.r,2), round(dfm.bolo.rstray,2), bolo.loopgain, round(nep*1e18,1), frac*100))
+                            plt.legend()
+                            plt.savefig(path + '/band_'+str(band) + '_tf_cs.png')
                         
-                        fig, ax = plt.subplots()
-                        plt.plot(bias_f/1e6, 1/dfm.tf, label='1/TF')
-                        plt.plot(bias_f/1e6, dfm.csf, label='CS')
-                        plt.xlabel('Bias frequency [MHz]')
-                        ax.set_title('TF + CS for {} GHz band $R_{{bolo}}$={}$\Omega$ $R{{stray}}$={}$\Omega$, \n $\mathcal{{L}}=${}, NEP$_{{read}}$={}aW$/\sqrt{{\mathrm{{Hz}}}}$, {}% NEP increase'.format(
-                        lb.opt_freqs[band] ,round(dfm.bolo.r,2), round(dfm.bolo.rstray,2), bolo.loopgain, round(nep*1e18,1), frac*100))
-                        plt.legend()
-                        plt.savefig(path + '/band_'+str(band) + '_tf_cs.png')
-                        
-                        note.append(dfm.squid.power)
+                            note.append(dfm.squid.power)
+
+                        try:
+                            pk_out[dfm.bolo.r][dfm.bolo.rstray] = dfm.total 
+                        except:
+                            pk_out[dfm.bolo.r] = {dfm.bolo.rstray : dfm.total }
                     
                     #print(n_sq)
                     break
@@ -223,5 +234,5 @@ for band in bands:
     
     
     
-
+pk.dump(pk_out, open(path + '/noise_dump.pkl','wb'))
 print(bands,note)

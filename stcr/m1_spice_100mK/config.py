@@ -81,7 +81,7 @@ csf_factor = False #if you want to assume the CSF is of by x factor
 ##############################   
 max_power = 10  #max sq power dissipation to show on plots colorbar
 
-
+dump_data = True #save data to pickle
 
 
 
