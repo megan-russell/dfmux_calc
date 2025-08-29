@@ -196,6 +196,55 @@ class DfMuxSystem:
         )
         return self.tf
 
+    def nei_johnson(self):
+        """
+        Calculates the NEI of Johnson noise using Eq. 11 from Tijmen's note.
+
+        $$\mathrm{NEI}^2 = \frac{8kT_b R_b}{|Z|^2} \left|1 - \frac{\mathcal{L}}{1+\mathcal{L}} \frac{1}{Z} \frac{R_b^2 \left( R_b-R_{\mathrm{Th\acute{e}v}} \right)}{R_b^2 - |z_{\mathrm{Th\acute{e}v}}|^2} \right|^2 + \frac{8kT_{\mathrm{Th\acute{e}v}} R_{\mathrm{Th\acute{e}v}}}{|Z|^2} \left|1 - \frac{\mathcal{L}}{1+\mathcal{L}} \frac{1}{Z} \frac{R_b^2 \left( R_b-R_{\mathrm{Th\acute{e}v}} + |Z| \right)}{R_b^2 - |z_{\mathrm{Th\acute{e}v}}|^2} \right|^2$$
+
+        TODO: implement proper circuit modeling to get the Thevenin equivalent circuit.
+        We'd calculate V_open and I_short, then set
+          z_thev = V_open / I_short
+          V_thev = V_open
+        This would be more accurate and remove the need to take into account separate "snubber" Johnson noise.
+
+        For now, just take the `stray_resistance` as the Thevenin impedance.
+        """
+        k = c.k
+        T_b = self.critical_temperature
+        R_b = self.operating_resistance
+        L = self.loopgain
+        R_stray = self.stray_resistance
+        T_thev = self.bath_temperature # assume Thevenin-equivalent resistance is at the bath temperature
+        z_thev = R_stray
+        R_thev = R_stray # Real part of z_thev
+        Z = R_b + z_thev
+
+        # Pre-calculate common factors
+        loop_factor = L / (1 + L)
+        Z_abs_sq = np.abs(Z)**2
+        z_thev_abs_sq = np.abs(z_thev)**2
+        common_denominator = R_b**2 - z_thev_abs_sq
+
+        if common_denominator == 0:
+            raise ValueError("Series impedance exactly cancels out bolometer resistance.")
+
+        # First term of the equation
+        coeff1 = (8 * k * T_b * R_b) / Z_abs_sq
+        numerator1 = R_b**2 * (R_b - R_thev)
+        complex_term1 = 1 - (loop_factor / Z) * (numerator1 / common_denominator)
+        term1 = coeff1 * np.abs(complex_term1)**2
+
+        # Second term of the equation
+        coeff2 = (8 * k * T_thev * R_thev) / Z_abs_sq
+        numerator2 = R_b**2 * (R_b - R_thev + np.abs(Z))
+        complex_term2 = 1 - (loop_factor / Z) * (numerator2 / common_denominator)
+        term2 = coeff2 * np.abs(complex_term2)**2
+
+        # Sum of terms gives NEI^2
+        nei_squared = term1 + term2
+
+        return np.sqrt(nei_squared)
     
     def calculate_noise(self, frequencies, skip_spice=False):
         """
@@ -247,13 +296,8 @@ class DfMuxSystem:
         self.demod = demod_noise * self.csf / self.tf / self.squid_transimpedance
         self.saa_scale = self.squid_input_noise * self.csf * np.sqrt(2)
 
-        # Bolometer Johnson noise
-        self.jnoise = (
-            np.sqrt(2)
-            * 1
-            / (1 + self.loopgain)
-            * np.sqrt(4 * c.k * self.critical_temperature / (self.operating_resistance + self.stray_resistance))
-        )
+        # Johnson noise from bolometer and stray resistance
+        self.jnoise = self.nei_johnson()
 
         # Add snubber Johnson noise if applicable
         if self.snubber:
