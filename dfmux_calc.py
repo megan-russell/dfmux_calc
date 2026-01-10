@@ -1,500 +1,350 @@
-#import packages
+"""
+dfmux_calc is a module inside the dfmux_calc repository. The module contains a class called DfMuxSystem that
+represents a DfMux system with SQUID, bolometer, wiring harness, and other parasitic elements. The class has
+a method called calculate_noise that calculates the expected readout noise at the given frequency(ies). The
+method optionally uses PySpice for CSF calculation.
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 from scipy import constants as c
-colors = [u'#1f77b4', u'#ff7f0e', u'#2ca02c', u'#d62728', u'#9467bd', 
-          u'#8c564b', u'#e377c2', u'#7f7f7f', u'#bcbd22', u'#17becf']
-import importlib.util
-import current_sharing as cs
+import current_sharing
 
 
+class DfMuxSystem:
+    """
+    Represents a DfMux system with SQUID, bolometer, wiring harness, and other parasitic elements.
+    """
 
-#helper class to store SAA information
-class squid:
-    def __init__(self, zt, rdyn, inoise, lin, lstray = 10e-9,
-                 n_series=False, n_parallel = False, power = False,
-                 linear_range=2e-6, snubber = False, snubber_c = False, t=0.3):
-        self.zt = np.array([zt]).flatten()            #Transimpedance of SAA
-        self.rdyn = np.array([rdyn]).flatten()        #Dynamic impedance of SAA
-        self.inoise = np.array([inoise]).flatten()    #SAA noise refered to input coil
-        self.lin = np.array([lin]).flatten()          #input inductance of the SAA
-        self.lstray = lstray
-        self.n_series = n_series #number of individual SQUIDs in series to form the SAA
-        self.n_parallel = n_parallel #number of banks of SQUIDs in parallel to form the SAA
-        self.power = power      #power dissipated by SAA when in operation
-        self.linear_range=linear_range #linear range of SAA input in Amps
-        self.snubber = snubber  # Resistance of any snubber used to regulate the SAA
-        self.snubber_c = snubber_c# Capcitance of any snubber used to regulate the SAA
-        self.t = t              #the temperature the SAA is operating at in Kelvin. This is ignored outside of 
-                                #calculating the johnson noise of any snubber. 
-            
-        self.m_factor = 1       #starting with a mutual inductance factor of 1 - this is just a note of how far
-                                #from base mutual inductance this has been modified
+    def __init__(
+        self,
+        squid_transimpedance=800.0,
+        squid_dynamic_impedance=300.0,
+        squid_input_noise=2.5e-12,
+        squid_input_inductance=15e-9,
+        # stray_inductance=10e-9,
+        n_series=False,
+        n_parallel=False,
+        power=False,
+        linear_range=2e-6,
+        snubber=False,
+        snubber_capacitance=False,
+        temperature=0.3,
+        operating_resistance=0.7,
+        loopgain=10,
+        stray_resistance=0.07,
+        saturation_power=2.5 * 0.24187821,
+        optical_power=0.24187821,
+        critical_temperature=0.170,
+        bath_temperature=0.100,
+        stripline_inductance=30e-12,
+        parasitic_capacitance=1.0e-12,
+        r48=0,
+        wire_harness_resistance=30,
+        wire_harness_capacitance=40e-12,
+        wire_harness_inductance=0.75e-6,
+        bias_resistance=0,
+        bias_inductance=5e-9,
+        Rnuller=3000,
+    ):
+        """
+        Initializes the DfMuxSystem object with the given parameters.
+        """
 
-    #method to rescale the existing SAA to a new array
-    def scale_SAA(self,new_series, new_parallel):
-        if not self.n_series and not self.n_parallel and not self.power:
-            print('squid has no specified array size and/or power!')
-            return
-        self.zt = self.zt * new_series / self.n_series
-        self.rdyn = self.rdyn * new_series / new_parallel * self.n_parallel / self.n_series
-        self.lin = (self.lin - self.lstray) * new_series * new_parallel / self.n_series / self.n_parallel + self.lstray
-        self.inoise = self.inoise * np.sqrt(self.n_series * self.n_parallel ) / np.sqrt(new_series * new_parallel)
-        self.power = self.power * new_series * new_parallel / self.n_series / self.n_parallel
-        self.n_series = new_series
-        self.n_parallel = new_parallel
-        
-    #method to scale the mutual inductance of the existing SAA up or down
-    def change_mutual_ind(self, m_factor):
-        self.zt *= m_factor
-        self.lin = (self.lin - self.lstray) * m_factor**2 + self.lstray
-        self.linear_range *= m_factor
-        self.m_factor *= m_factor
-        
-    def print_info(self):
-        print('Transimpedence: {} $\Omega$'.format(round(self.zt,0)))
-        print('Dyn. impedence: {} $\Omega$'.format(round(self.rdyn,0)))
-        print('Input inductance: {} nH'.format(round(self.lin/1e-9,0)))
-        print('NEI: {} pA/rtHz'.format(round(self.inoise/1e-12,1)))
-        print('Power dis.: {} nW'.format(round(self.power/1e-9,0)))
-        print('Array size: {}x{}'.format(self.n_series, self.n_parallel))
-        print('Linear range: {} $\mu$A'.format(round(self.linear_range/1e-6,2)))
-        
+        # SQUID parameters
+        self.squid_transimpedance = squid_transimpedance
+        self.squid_dynamic_impedance = squid_dynamic_impedance
+        self.squid_input_noise = squid_input_noise
+        self.squid_input_inductance = squid_input_inductance
+        # self.stray_inductance = stray_inductance
+        self.n_series = n_series
+        self.n_parallel = n_parallel
+        self.power = power
+        self.linear_range = linear_range
+        self.snubber = snubber
+        self.snubber_capacitance = snubber_capacitance
+        self.temperature = temperature
 
-#helper class to store bolometer information
-class bolo:
-    def __init__(self,r,loopgain,rstray,psat,popt,tc,tb):
-        self.r = np.array([r]).flatten()                    #Operating resistance of the bolometer in ohms
-        self.loopgain = np.array([loopgain]).flatten()      #operating loopgain of the bolometer
-        self.rstray = np.array([rstray]).flatten()          #stray resistance in series with the bolometer in ohms
-        self.psat = np.array([psat]).flatten()              #saturation power of the bolometer in watts
-        self.popt = np.array([popt]).flatten()              #optical power on bolometer in watts
-        self.tc = np.array([tc]).flatten()                  #critical temperature of the bolometer in kelvin
-        self.tb = np.array([tb]).flatten()                  #bath temperature the bolometer is operated at in kelvin
-        self.si = self.calc_responsivity()                  #TES responsivity in units A/W
+        # Bolometer parameters
+        self.operating_resistance = operating_resistance
+        self.loopgain = loopgain
+        self.stray_resistance = stray_resistance
+        self.saturation_power = saturation_power
+        self.optical_power = optical_power
+        self.critical_temperature = critical_temperature
+        self.bath_temperature = bath_temperature
 
-    def calc_responsivity(self):
-        # note this does not include a responsivity boost from parasitics
-        pbias = (self.psat - self.popt).reshape(-1, 1)
-        si = np.sqrt(2 / self.r.reshape(-1, 1) / pbias) * self.loopgain.reshape(-1, 1) / (self.loopgain.reshape(-1, 1) + 1)
-        return si
-        
-#helper class to store important parasitics
-class parasitics:
-    def __init__(self,stripline, c_gnd, r48=0):
-        self.stripline = stripline    #self inductance in henries of the stripline conecting the SAA to the rest of the 
-                                      #DfMUX circuit - or in its absence and stray inductance that looks like it
-        self.c_gnd = c_gnd            #the parasitic capacitance in farads to ground from the focal plane, bolometers or LCs
-        self.r48 = r48                #The value in ohms of R48 on the SQUID Controller Boards - this connected the negative
-                                      #side of the nuller to ground and in 2022 its default value is 0 Ohms
+        # Parasitic parameters
+        self.stripline_inductance = stripline_inductance
+        self.parasitic_capacitance = parasitic_capacitance
+        self.r48 = r48
 
-#helper class to store wiring harness information and do some calculations    
-class wire:
-    def __init__(self, r, c, l, rshunt=False, cshunt=False):
-        self.r = r              #wiring harness series resistance
-        self.c = c              #capacitance
-        self.l = l              #series self inductance
-        self.rshunt = rshunt    #if a shunt resistor is places across the SAA output on the SQCB
-        self.cshunt = cshunt    #if a shunt capacitor is placed across the SAA output on the SQCB
-        
-        
-    #Calculate the series impedance of the wiring harness at a single given frequency
-    #deceause of how transmission line models typically count wire resistance + inductance this is equivalent to
-    #1 single wire of double length
-    def series_imp(self,f):
-        return 2j * np.pi * f * self.l + self.r
-    
-    
-    #this calculates the complex ABCD or cascade matrix for the wiring harness using the transmision line model
-    #at a given single frequency, taking into account resistive or capacitive shunts which are assumed to be
-    #at the 300K input to a SQUID Controller board
-    def get_abcd(self,f):
-        wire_series = 2j * np.pi * f * self.l + self.r
-        wire_shunt = 2j * np.pi * f * self.c
-        
+        # Wiring harness parameters
+        self.wire_harness_resistance = wire_harness_resistance
+        self.wire_harness_capacitance = wire_harness_capacitance
+        self.wire_harness_inductance = wire_harness_inductance
+
+        # Bias element
+        self.bias_resistance = bias_resistance
+        self.bias_inductance = bias_inductance
+
+        # Nuller chain
+        self.nuller_resistance = Rnuller  # Resistance of the nuller current stiffening resistor [ohms]
+        self.nuller_cold = False
+
+        # initialize other attributes
+        self.tf = None
+        self.f = None
+        self.csf = None
+        self.demod = None
+        self.saa_scale = None
+        self.inoise = None
+        self.jnoise = None
+        self.total_noise = None
+
+    def calculate_responsivity(self):
+        """
+        Calculates the TES responsivity, assuming no excess responsivity.
+
+        TODO: implement excess responsivity
+        """
+        bias_power = self.saturation_power - self.optical_power
+        return np.sqrt(2 / self.operating_resistance / bias_power) * self.loopgain / (self.loopgain + 1)
+
+    def nei_to_nep(self, optical_power):
+        """
+        Converts NEI to NEP for the given optical power.
+        """
+        vbias = np.sqrt((self.operating_resistance + self.stray_resistance) * (self.saturation_power - optical_power))
+        loop_attenuation = (self.operating_resistance - self.stray_resistance) / (self.operating_resistance + self.stray_resistance)
+        responsivity = (
+            np.sqrt(2)
+            / vbias
+            * self.loopgain
+            * loop_attenuation
+            / (
+                1
+                + self.loopgain
+                * loop_attenuation
+                * (self.operating_resistance - self.stray_resistance)
+                / (self.operating_resistance + self.stray_resistance)
+            )
+        )
+        return 1 / responsivity
+
+    def wire_series_impedance(self, frequency):
+        """
+        Calculates the series impedance of the wiring harness at a given frequency.
+        """
+        return 2j * np.pi * frequency * self.wire_harness_inductance + self.wire_harness_resistance
+
+    def wire_get_abcd(self, frequency):
+        """
+        Calculates the ABCD matrix for the wiring harness at a given frequency.
+        """
+        wire_series = self.wire_series_impedance(frequency)
+        wire_shunt = 2j * np.pi * frequency * self.wire_harness_capacitance
         gamma = np.sqrt(wire_series * wire_shunt)
         z0 = np.sqrt(wire_series / wire_shunt)
-        
-        b = z0 * np.sinh(gamma)
-        if self.rshunt != False:
-            a = np.cosh(gamma) + b/self.rshunt
-        else:
-            a = np.cosh(gamma)
-        if self.cshunt != False:
-            a = a + b * 2j*np.pi*f*self.cshunt
-            
-        
-        d = np.cosh(gamma)
-        if self.rshunt != False:
-            c = 1/z0 * np.sinh(gamma) + d/self.rshunt
-        else:
-            c = 1/z0 * np.sinh(gamma)
-        if self.cshunt != False:
-            c = c + d * 2j*np.pi*f*self.cshunt
-        return a, b, c, d
-    
-    
-    #Calculates the effective resistance seen by the input of the 1st stage amplifier on the SQUID Controller board
-    #this is used to calculate how the input current noise of that amplifer translates to voltage noise
-    #at a given frequency and for a given squid with a dynamic impedance
-    def reff(self,squid,f):
-        [a,b,c,d] = self.get_abcd(f)
-        return np.abs( (b + d * squid.rdyn.reshape(-1, 1))/( a + c * squid.rdyn.reshape(-1, 1)))
-    
-    #Calculates the real effective resistance seen by the input of the 1st stage amplifier on the SQUID Controller board
-    #without the SAA dynamic impedance, this is used to calculate the johnson noise of the wiring harness and any shunt elements
-    def real_reff(f):
-        [a,b,c,d] = self.get_abcd(f)
-        return np.real( (b )/( a ))
-        
-            
-    #calculates the voltage transfer function from the mK output of the SAA to the input of the 300K SQCB
-    #for a list of frequencies and SAA with a dynamic impedance and stores the transfer function as a property of the wire
-    def transfer_function(self, squid, frequencies):
-        [a,b,c,d] = self.get_abcd(frequencies) 
-        self.tf = np.abs(1/(a + c * (squid.rdyn.reshape(-1, 1)  ) - ( b + d * (squid.rdyn.reshape(-1, 1)))/1e6 )) 
+        b_element = z0 * np.sinh(gamma)
+        a_element = np.cosh(gamma)  # Assuming no shunt resistor
+        d_element = np.cosh(gamma)
+        c_element = 1 / z0 * np.sinh(gamma)  # Assuming no shunt capacitor
+        return a_element, b_element, c_element, d_element
+
+    def wire_reff(self, frequency):
+        """
+        Calculates the effective resistance seen by the 1st stage amplifier.
+        """
+        a_element, b_element, c_element, d_element = self.wire_get_abcd(frequency)
+        return np.abs((b_element + d_element * self.squid_dynamic_impedance) / (a_element + c_element * self.squid_dynamic_impedance))
+
+    def wire_real_reff(self, frequency):
+        """
+        Calculates the real effective resistance without SAA dynamic impedance.
+        """
+        a_element, b_element, _, _ = self.wire_get_abcd(frequency)
+        return np.real(b_element / a_element)
+
+    def wire_transfer_function(self, frequencies):
+        """
+        Calculates the voltage transfer function of the wiring harness.
+        """
+        a_element, b_element, c_element, d_element = self.wire_get_abcd(frequencies)
+        self.tf = np.abs(
+            1 / (a_element + c_element * self.squid_dynamic_impedance - (b_element + d_element * self.squid_dynamic_impedance) / 1e6)
+        )
         return self.tf
-    
-    #Calculates the nuller(/carrier transfer function with inductive bias elements) from the wiring harness 
-    #returns a ratio of current cold to current warm
-    def nuller_tf(self,inductor,frequencies):
-        itf = []
-        for f in frequencies:
-            
-            [a,b,c,d] = self.get_abcd(f) 
-            itf.append( np.abs(1/(c*2j*np.pi*f*inductor-d)))
-        return itf
 
+    def nei_johnson(self):
+        """
+        Temporary implementation of Johnson noise.
+        Replaces the old implementation which assumed perfect voltage bias, but takes
+        the stray resistance as the Thevenin impedance.
 
+        TODO: implement proper circuit modeling to get the Thevenin equivalent circuit.
+        We need to calculate V_open and I_short for each bolometer, then set
+          z_thev = V_open / I_short
+          V_thev = V_open
+        This would be more accurate and remove the need to take into account separate "snubber" Johnson noise.
 
-class dfmux_noise:
-    
-    def __init__(self, squid, bolo, wire, para, nuller_wire=None, nuller_cold=False,bias_res=False):
-        self.squid = squid         #a squid object 
-        self.bolo = bolo           #a bolometer object
-        self.wire = wire           #a wiring harness object
-        self.para = para           #a parasitics object
-        self.nuller_wire = nuller_wire #a wiring harness object for the nuller lines if this is different than the ones used for the
-        self.nuller_cold = nuller_cold #if the current stiffening resistors for the nuller are located on the 300K stage this is False, if they are located on the 4K stage this is true
-                                   #SQUID output lines. By default this is None and it is assumed they are the same.
-        
-        #Warm electrnics noise
-        #carrier = 1.6e-12                                        #A/rtHz JM PhD Table 7.5
-        carrier = 2.9e-12/(bolo.r + bolo.rstray)                  #A/rtHz JM PhD Table 7.5 with bias johnson removed, and scaled by bolometer resistance
-        if self.nuller_cold:
-            nuller = np.sqrt(0.38e-12**2 + 3.6e-12**2)           #A/rtHz JM PhD p176 + table 7.6
-        else:
-            nuller = 4.9e-12                                     #A/rtHz JM PhD Table 7.6
-        self.warm_noise_nc = np.sqrt(carrier**2 + nuller**2)     #total noise from the carrier/nuller refered to SAA input
-        
+        For now, just take the `stray_resistance` as the Thevenin impedance.
+        """
+        T_b = self.critical_temperature
+        R_b = self.operating_resistance
+        L = self.loopgain
+        T_thev = self.bath_temperature  # assume Thevenin-equivalent resistance is at the bath temperature
+        z_thev = self.stray_resistance  # for now, use the stray resistance as the Thevenin-equivalent impedance
+        return self.johnson_noise(T_b, R_b, L, T_thev, z_thev)
 
-        #bolometer noise
-        self.jnoise = np.sqrt(2) * 1/(1+self.bolo.loopgain)*np.sqrt(4*1.38e-23*self.bolo.tc / (self.bolo.r))  #JM masters section 5.6
-        
-        #if a snubber is being used - add the johnson noise of it in quadrature with bolometer johnson noise
-        #this assumes that the snubber is at the same temperature stage as the SAA 
-        if self.squid.snubber != False:
-            self.jnoise = np.sqrt(self.jnoise**2 + 4*1.38e-23*self.squid.t / (self.squid.snubber)) 
-        
-        #if the circuit is using a bias resistor, assume it is 30mOhm and at the same temperature as the SQUID
-        #this is multiplied by sqrt(2) due to AC bias and divided by the comb impedance to refer to SQ input coil, JM PhD table 7.8
-        if bias_res:
-            self.jnoise = np.sqrt(self.jnoise**2 + 2*4*1.38e-23*self.squid.t *0.03/(bolo.r + bolo.rstray)**2)
+    def johnson_noise(self, T_b, R_b, L, T_thev, z_thev):
+        """
+        Implementation of  Eq. 11 from Tijmen's note, calculating the NEI of Johnson noise
+        in the general case of a Thevenin-equivalent circuit.
 
-    
+        $$\mathrm{NEI}^2 = \frac{8kT_b R_b}{|Z|^2} \left|1 - \frac{\mathcal{L}}{1+\mathcal{L}} \frac{1}{Z} \frac{R_b^2 \left( R_b-R_{\mathrm{Th\acute{e}v}} \right)}{R_b^2 - |z_{\mathrm{Th\acute{e}v}}|^2} \right|^2 + \frac{8kT_{\mathrm{Th\acute{e}v}} R_{\mathrm{Th\acute{e}v}}}{|Z|^2} \left|1 - \frac{\mathcal{L}}{1+\mathcal{L}} \frac{1}{Z} \frac{R_b^2 \left( R_b-R_{\mathrm{Th\acute{e}v}} + |Z| \right)}{R_b^2 - |z_{\mathrm{Th\acute{e}v}}|^2} \right|^2$$
+        """
+        Z = R_b + z_thev
+        R_thev = np.real(z_thev)
 
-    def init_freq(self, frequencies, #frequencies to calculate noise at
-                  dan=True,          #if this is a dan on noise calculation or not
-                  skip_spice = False,#if you want to skip the pyspice sim and fall back on an approximation
-                  recal_csf = True,  #if you want to recalculate csf from scratch each time , only set to False for iterating SAA size, only Lin is changed
-                  csf_factor = False, #if you want to assume you're underestimating the CSF by x% set to 1.x instead of False and it will be applied to the calculated csf
-                  csf=None):         #if you want to calculate noise with a given csf (this must be the same size as frequencies)
-        
-            
-        
+        # Pre-calculate common factors
+        loop_factor = L / (1 + L)
+        Z_abs_sq = np.abs(Z) ** 2
+        z_thev_abs_sq = np.abs(z_thev) ** 2
+        common_denominator = R_b**2 - z_thev_abs_sq
+
+        if common_denominator == 0:
+            raise ValueError("Series impedance exactly cancels out bolometer resistance.")
+
+        # First term of the equation
+        coeff1 = (8 * c.k * T_b * R_b) / Z_abs_sq
+        numerator1 = R_b**2 * (R_b - R_thev)
+        complex_term1 = 1 - (loop_factor / Z) * (numerator1 / common_denominator)
+        term1 = coeff1 * np.abs(complex_term1) ** 2
+
+        # Second term of the equation
+        coeff2 = (8 * c.k * T_thev * R_thev) / Z_abs_sq
+        numerator2 = R_b**2 * (R_b - R_thev + np.abs(Z))
+        complex_term2 = 1 - (loop_factor / Z) * (numerator2 / common_denominator)
+        term2 = coeff2 * np.abs(complex_term2) ** 2
+
+        # Sum of terms gives NEI^2
+        nei_squared = term1 + term2
+
+        return np.sqrt(nei_squared)
+
+    def calculate_noise(self, frequencies, skip_spice=False):
+        """
+        Calculates the expected readout noise at the given frequency(ies).
+        """
+
         self.f = np.array(frequencies)
-        self.csf = []                    #current sharing factor
-        self.tf = []                     #wiring harness transfer function
-        self.saa_in_impedance = []       #impedance of the SAA imput coil
-        self.on_res_comb_impedance = []  #impedance of the comb assuming on resonance
-        self.c_r48 = []                  #impedance of the parasitic path through ground and R48
-        self.demod = []                  #total demodulator noise refered to the input of the SAA A/rtHz
-        self.total = []                  #total noise refered to the input of the SAA pA/rtHz
-        #self.wire_j = []
-        if not dan:
-            self.jnoise_f = []
-            self.warm_noise_nc_f = []
-            self.saa_scale_f = []
-        
-        
-        
-        #demod chain noise
-        #see JM PhD table 7.7 1st stage amplifier
-        if self.wire.rshunt==False:
-            req=(1/(1/10 + 1/100 + 1/150) + 1/(1/4.22e3 + 1/ (self.wire.reff(self.squid,self.f))) ) #RSQCB as defined in table 7.7
-            first_amp = np.sqrt(2) * np.sqrt((1.1e-9)**2  +
-                                (2.2e-12* req)**2)
-            
-            
-        #this is a modification to the previous line that adds the johnson noise of the shunt resistor
-        #currently assuming that it is well represented by a current source in parallel with the 1st stage amplifier
-        #which adds in quadrature with that current noise and is then scaled by the impedance as defined in Joshua's thesis
-        #the change in Reff due to the shunt will be automatically handled by the reff function
+
+        # Warm electronics noise
+        carrier_noise = 2.9e-12 / (self.operating_resistance + self.stray_resistance)
+        nuller_noise = self.calculate_nuller_noise()
+        warm_noise = np.sqrt(carrier_noise**2 + nuller_noise**2)
+
+        # Demodulator chain noise (details in Joshua Montgomery's PhD thesis)
+        reff = 1 / (1 / 10 + 1 / 100 + 1 / 150) + 1 / (1 / 4.22e3 + 1 / self.wire_reff(self.f))
+        first_amp_noise = np.sqrt(2) * np.sqrt((1.1e-9) ** 2 + (2.2e-12 * reff) ** 2)
+        demod_noise = np.sqrt(
+            first_amp_noise**2
+            + 2
+            * (
+                0.23e-9**2
+                + 0.14e-9**2
+                + (8.36e-9 * self.wire_reff(self.f) / (self.wire_reff(self.f) + 4.22e3)) ** 2
+                + 4 * c.k * 300 * self.wire_harness_resistance
+            )
+        )
+
+        if skip_spice or current_sharing.loaded_pyspice is False:
+            # Calculate current sharing analytically
+            # (some information in SA sensitivity paper, adapted from Joshua's SPT-3G paper)
+            self.csf = current_sharing.get_csf_analytically(self)
+
         else:
-            req=(1/(1/10 + 1/100 + 1/150) + 1/(1/4.22e3 + 1/ (self.wire.reff(self.squid,self.f))) ) #RSQCB as defined in table 7.7
-            first_amp = np.sqrt(2) * np.sqrt(   (1.1e-9)**2  +
-                                ( np.sqrt(  (2.2e-12)**2 +  4* 1.38e-23 *300/self.wire.rshunt  ) * req)**2
-                                    #+(4* 1.38e-23 *300 / (self.wire.r+self.wire.rshunt)*(self.wire.reff(self.squid,f))**2))
-                                    #+(4* 1.38e-23 *300 * (self.wire.r+self.wire.rshunt))
-                                   #(2.2e-12 * req)**2 +  
-                                   #        1.38e-23 *300/self.wire.rshunt * (self.wire.reff(self.squid,f))**2 
-                                                )
+            # Use PySpice for CSF calculation
+            self.csf = current_sharing.get_csf(self)
+            print("CSF calculation with Spice completed.")
+            if len(self.csf) != len(self.f):
+                raise ValueError(
+                    f"The current sharing calculation should have found exactly one LC resonant peak for each of the {len(self.f)} input frequencies, but instead found {len(self.csf)} peaks."
+                )
 
-        #table 7.7- the rest of the terms
-        demod_dc = np.sqrt(first_amp**2 + 
-                               2*(0.23e-9**2 +     #ADC noise
-                                  0.14e-9**2 +     #2nd stage amplifier
-                               #0.36e-9**2 +        #Signal path johnson - think this is just wiring harness johnson
-                                  (8.36e-9*self.wire.reff(self.squid,self.f)/(self.wire.reff(self.squid,self.f)+4.22e3))**2   #SQUID I bias johnson
-                                  + 4* 1.38e-23 *300 * self.wire.r ))  #johnson noise of the wiring harness resistance
-                                                                      #pessimisitcally assuming that the entire harness is at 300K
-            
-            
-            
-        if dan:
-            #in this case estimate the current sharing factor based off of JM SPT-3G noise paper
-            try:
-                if csf == None:
-                    spec = importlib.util.find_spec('PySpice')
-                    if spec is None or skip_spice == True:
-                        if not skip_spice:
-                            print("PySpice is not installed... continuing with analytic approximation")
+        # Calculate wiring harness transfer function
+        self.tf = np.array(self.wire_transfer_function(self.f))
 
+        # Scale demodulator noise and SAA noise
+        self.demod = demod_noise * self.csf / self.tf / self.squid_transimpedance
+        self.saa_scale = self.squid_input_noise * self.csf * np.sqrt(2)
 
-                        ##Calculate the impedances necesary for current sharing
+        # Johnson noise from bolometer and stray resistance
+        self.jnoise = self.nei_johnson()
 
-                        #the input impedance of the SAA
-                        self.saa_in_impedance =  2 * np.pi * self.f * self.squid.lin  
+        # Add snubber Johnson noise if applicable
+        if self.snubber:
+            self.jnoise = np.sqrt(self.jnoise**2 + 4 * c.k * self.temperature / self.snubber)
 
-                        #the comb impedance- assuming this is for an on resonance frequency
-                        if not self.squid.snubber:
-                            self.on_res_comb_impedance =  2 * np.pi * self.f * self.para.stripline + self.bolo.r.reshape(-1, 1) + self.bolo.rstray.reshape(-1, 1)  
-                        else:
-                            self.on_res_comb_impedance =   1/(
-                                1/(2 * np.pi * self.f * self.para.stripline + self.bolo.r.reshape(-1, 1) + self.bolo.rstray.reshape(-1, 1)  ) + 1/self.squid.snubber ) 
+        # Calculate total noise
+        self.total_noise = np.sqrt(warm_noise**2 + self.jnoise**2 + self.demod**2 + self.saa_scale**2)
 
-                        #the impedance of the path through ground and R48
-                        self.c_r48 =   1/(2 * np.pi * self.f * self.para.c_gnd) + self.para.r48 
+    def calculate_nuller_noise(self):
+        """
+        Function to calculate the nuller chain NEI
+        Based on table 7.6 of Joshua Montgomery's thesis
 
-                        #combining those terms to estimate the current sharing factor- from joshua's spt3g paper
-                        if self.nuller_wire == None:
-                            self.csf =  1/(self.c_r48 / ( (self.on_res_comb_impedance + np.abs(self.wire.series_imp(self.f))) * 
-                                             self.saa_in_impedance / 
-                               (self.on_res_comb_impedance + self.saa_in_impedance + np.abs(self.wire.series_imp(self.f))) + 
-                               np.abs(self.wire.series_imp(self.f)) + self.c_r48 ) * 
-                                    self.on_res_comb_impedance / (self.on_res_comb_impedance + self.saa_in_impedance))
+        Joshua doesn't include an equation for H_n on his thesis
+        so we will simply scale Hn based on R_nuller
+        following TF_corr in pydfmux/core/utils/transferfunctions.py convert_tf()
 
-                        #if nuller_wire is not none this has a different wiring than connected to the SAA output
-                        else:
-                            self.csf =  1/(self.c_r48 / ( (self.on_res_comb_impedance + np.abs(self.nuller_wire.series_imp(self.f))) * 
-                                             self.saa_in_impedance / 
-                               (self.on_res_comb_impedance + self.saa_in_impedance + np.abs(self.nuller_wire.series_imp(self.f))) + 
-                               np.abs(self.nuller_wire.series_imp(self.f)) + self.c_r48 ) * 
-                                    self.on_res_comb_impedance / (self.on_res_comb_impedance + self.saa_in_impedance))
-                    else:
-                        #instead use a full PySpice calculation
-                        self.csf = cs.get_csf(self)
-                    
-                
-            #in this case take the measured CSF given as input
-            except:
-                self.csf = np.array(csf)
-            
-        #this is an option to calculate SQCB input refered noise with DAN off forcing CSF to not impact the noise
-        else:
-            self.csf = np.ones(lens(self.f))
-                
-        #applying the CSF factor if asked for
-        if csf_factor != False:
-            self.csf *= csf_factor
-                
-        #calculating the transfer function caused by the SAA Z_dyn and the wiring harness capacitance/any shunts across SAA
-        self.tf = np.array(self.wire.transfer_function(self.squid,self.f))
-            
-        #scaling the noise from the warm electronics by the current sharing factor, the transfer function
-        # and the transimpedance of the saa to refer it to the SAA input coil - units now A/rtHz
-        if dan:
-            self.demod= demod_dc * self.csf / self.tf / self.squid.zt.reshape(-1, 1) 
-        else:
-            self.demod =  demod_dc * np.ones(self.f) 
-                
-        #self.wire_j.append(np.sqrt(4* 1.38e-23 *300 * self.wire.real_reff(self.squid,f)*np.sqrt(2)*self.csf[-1]/self.squid.zt))
+        Because we don't know the H_n frequency dependency, we'll simply take the
+        average numbers on the table at 1.7 and 4.57 - there doesn't seem to be
+        too much difference in them.
 
-            
-        #scaling the noise of the SAA by the current sharing factor and the demodulation factor
-        if dan:
-            self.saa_scale = self.squid.inoise.reshape(-1, 1) * self.csf * np.sqrt(2)
-        #or if dan off noise by the transimpedance and tf to refer to SQCB
-        else:
-            self.saa_scale_f = self.squid.inoise * self.squid.zt.reshape(-1, 1) * self.tf * np.sqrt(2)
-            
-        #total noise from all sources in order the noise from the carrier/nuller chain, the johnson noise of the bolo
-        #the scaled demodulator chain noise, and the scaled SAA noise in PICOAMPS/rtHz
-        if dan:
-            self.total = np.sqrt(self.warm_noise_nc**2 + self.jnoise**2 + self.demod**2 + self.saa_scale**2)
-            
-        #if dan is off refering remaining terms to SQCB input - outputs noise in nV/rtHz
-        else:
-            self.warm_noise_nc_f = self.warm_noise_nc* self.squid.zt.reshape(-1, 1)* self.tf
-            self.jnoise_f = self.jnoise* self.squid.zt.reshape(-1, 1)* self.tf
-            self.total = np.sqrt((self.warm_noise_nc_f)**2  + (self.jnoise_f)**2 + 
-                                          self.demod**2 + self.saa_scale_f**2)*1e9
-                
-        
+        We'll calculate everything in units of pA/sqrt(Hz) and at the end convert to
+        A/sqrt(Hz)
+        """
+        Rnuller_default = 750 * 4  # the default nuller stiffening resistor [omhs]
+
+        Hn_scaling = Rnuller_default / self.nuller_resistance
+
+        NEI_DAC = 2.4 * Hn_scaling  # the dac noise [pA/sqrt(Hz)]
+        NEI_quantization = 0.65 * Hn_scaling  # the quantization noise [pA/sqrt(Hz)]
+        NEI_amplifiers = 1.65 * Hn_scaling  # the noise from the amplifiers [pA/sqrt(Hz)]
+
+        NEI_signal_path = 0.9  # the signal path johnson noise [pA/sqrt(Hz)]
+
+        # Get the johnson noise of the nuller current stiffening resistor
+        if self.nuller_cold:  # if the nuller resistor is cold, set its temperature to the bath temp
+            T_Rnuller = self.bath_temperature
+        else:  # if not, assume nuller resistor is at room temperature
+            T_Rnuller = 300  # [K]
+        NEI_Rnuller_johnson = np.sqrt(2) * np.sqrt(4 * T_Rnuller * c.k / self.nuller_resistance) * 1e12  # [pA/sqrt(Hz)]
+
+        NEI_squid_bias = 1.3  # squid flux bias johnson [pA/sqrt(Hz)]
+
+        NEI_feedback = 1.3  # Low Frequency Feedback Johnson [pA/sqrt(Hz)]
+
+        # quadrature sum
+        nuller_noise = np.sqrt(
+            NEI_DAC**2
+            + NEI_quantization**2
+            + NEI_amplifiers**2
+            + NEI_signal_path**2
+            + NEI_Rnuller_johnson**2
+            + NEI_squid_bias**2
+            + NEI_feedback**2
+        )
+
+        return nuller_noise * 1e-12  # convert back to pA/sqrt(Hz)
 
 
-#helper function which takes a SQUID object as input and returns another SQUID object as output
-#it takes warm transimpecence dyn impedance etc measurements dont with a resistive shunt in place
-#and calculates the expected parameters for the SQUID on its own, assuming the measurements were done
-#with a 1.6 uA current bias step as is pydfmux's default behavior
-def refer_squid(warm_squid, shunt):
-    delta_v = warm_squid.rdyn*1.6e-6
-    cold_zdyn = delta_v / (1.6e-6 - delta_v /shunt)
-    
-    cold_zt = warm_squid.zt * (cold_zdyn + shunt ) / shunt
-    
-    return squid(cold_zt, cold_zdyn, warm_squid.inoise, warm_squid.lin)
-  
+if __name__ == "__main__":
+    dfmux_system = DfMuxSystem()
 
-#function to produce conversion factor from pA/rtHz NEI to NEP
-def nei_to_nep(dfmux_noise,optical_power):
-    vbias = np.sqrt( (dfmux_noise.bolo.r + dfmux_noise.bolo.rstray) * (dfmux_noise.bolo.psat - optical_power) )
-    loop_atten = (dfmux_noise.bolo.r - dfmux_noise.bolo.rstray)/(dfmux_noise.bolo.r + dfmux_noise.bolo.rstray)
-    responsivity =  np.sqrt(2) / vbias * dfmux_noise.bolo.loopgain*loop_atten / (1 + dfmux_noise.bolo.loopgain*loop_atten * (
-        dfmux_noise.bolo.r - dfmux_noise.bolo.rstray)/(dfmux_noise.bolo.r + dfmux_noise.bolo.rstray ) ) 
-    return 1/responsivity
-
-
-
-#function to make plots of the noise 
-
-def plot_noise(dfmux_noise,f,c,label=None):
-    plt.plot(f/1e6,dfmux_noise.total.flatten()*1e12,c=c,label=label)
-    plt.legend()
-    plt.plot(f/1e6,np.abs(dfmux_noise.demod.flatten())*1e12 ,'--',label='DEMOD noise',c=c)
-    plt.plot(f/1e6,dfmux_noise.saa_scale.flatten()*1e12  ,'-.',label='SAA noise',c=c)
-    plt.plot(f/1e6,[np.abs(dfmux_noise.jnoise )*1e12 for i in range(len(f))] ,':', label = 'Cryo. Johnson',lw=2,c=c)
-    plt.plot(f/1e6,[np.abs(dfmux_noise.warm_noise_nc )*1e12 for i in range(len(f))] ,':', label = 'Nuller and Carrier',c=c)
-    if c == colors[0]:
-        plt.legend()
-    plt.xlabel('Bias frequency [MHz]')
-    plt.ylabel('Noise [pA/rtHz]')
-    
-    
-def sweep_squids(dfmux_noise,start_n=10,end_n=200,step=5):
-    f1 = plt.figure('total')
-    f2 = plt.figure('csf')
-    f3 = plt.figure('tf')
-    
-    norm = mpl.colors.Normalize(vmin=start_n, vmax=end_n)
-    cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.jet)
-    cmap.set_array([])
-    
-    
-    for n in range(start_n, end_n, step):
-        dfmux_noise.squid.scale_SAA(n,dfmux_noise.squid.n_parallel)
-        dfmux_noise.init_freq(dfmux_noise.f)
-        
-        plt.figure('total')
-        plt.plot(dfmux_noise.f/1e6,dfmux_noise.total,c=cmap.to_rgba(n))
-        
-        
-        plt.figure('csf')
-        plt.plot(dfmux_noise.f/1e6,dfmux_noise.csf,c=cmap.to_rgba(n))
-        
-        
-        plt.figure('tf')
-        plt.plot(dfmux_noise.f/1e6,dfmux_noise.tf,c=cmap.to_rgba(n))
-        
-        
-    plt.figure('total')
-    plt.xlabel('Bias Frequency [MHz]')
-    plt.ylabel('Total noise [pA/$\sqrt{\mathrm{Hz}}$]')
-    cbar = f1.colorbar(cmap)
-    cbar.set_label('Number of SQUIDs in series')
-    
-    
-    plt.figure('csf')
-    plt.xlabel('Bias Frequency [MHz]')
-    plt.ylabel('Current sharing factor')
-    cbar = f2.colorbar(cmap)
-    cbar.set_label('Number of SQUIDs in series')
-    
-    
-    
-    plt.figure('tf')
-    plt.xlabel('Bias Frequency [MHz]')
-    plt.ylabel('SAA transfer function')
-    cbar = f3.colorbar(cmap)
-    cbar.set_label('Number of SQUIDs in series')
-        
-        
-        
-#function to make plots of noise as function of bolometer operating impedance and stray resistance
-def plt_nei_v_r(saa, bolo, wh, para,f,vmin=None,vmax=None):
-    
-    rbolo, rstray = np.meshgrid(np.linspace(0.2, 1.0 , 100), np.linspace(0, 0.2, 100))
-
-    noise_min = np.zeros(rbolo.shape)
-    noise_max = np.zeros(rbolo.shape)
-
-    i=0
-    j=0
-    for b in rbolo[0]:
-        for s in rstray[:,0]:
-            bolo.r=b
-            bolo.rstray = s
-            cnoise1 = dfmux_noise(saa,bolo,wh,para,nuller_cold=True)
-            cnoise1.init_freq(f)
-            noise_min[i][j] = np.min(cnoise1.total)
-            noise_max[i][j] = np.max(cnoise1.total)
-            j+=1
-        
-        i+=1
-        j=0
-    
-    fig, ax = plt.subplots()
-
-    c = ax.pcolormesh(rbolo, rstray, noise_min, vmin=vmin, vmax=vmax, cmap='jet')
-    CS = ax.contour(rbolo, rstray, noise_max, 6, colors='k') 
-    ax.clabel(CS, fontsize=9, inline=True)
-    cbar = fig.colorbar(c, ax=ax)
-    
-    plt.xlabel('$R_{bolo}$')
-    plt.ylabel('$R_{stray}$')
-    cbar.set_label('Low bias frequency noise [pA/$\sqrt{\mathrm{Hz}}$]')
-    
-    
-#function to make PDF that can be an input to BoloCalc
-def make_PDF_for_bolocalc(dfmux_noise, filename,
-                          n_bins = 101, noise_low = 0, noise_high = 50):
-    try:
-        if len(dfmux_noise.total) < 100:
-            print('Fewer than 100 neis! Likely not enough samples for a good PDF. Continuing...')
-    except:
-        print('No noise! please run init_freq first')
-        return
-    
-    bins = np.linspace(noise_low, noise_high, n_bins)
-    dat = np.histogram(dfmux_noise.total.flatten()*1e12,bins=bins)
-
-    #normalizing bc BoloCalc wants a normaized PDF
-    dat = (dat[0]/np.sum(dat[0]) , dat[1])
-
-    f = open(filename,'w')
-    for i in range(n_bins-1):
-        f.write(str(dat[1][i]) + ' , '  + str(dat[0][i]) + ' \n') 
-
-
-
+    # Calculate and print NEI
+    this_frequency = 4e6
+    dfmux_system.calculate_noise(frequencies=np.array([this_frequency]), skip_spice=False)
+    nei = dfmux_system.total_noise[0] * 1e12  # in pA/rtHz
+    print(f"NEI at {this_frequency / 1e6} MHz: {nei:.2f} pA/rtHz")
